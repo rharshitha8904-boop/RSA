@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RSA Encryption Demo — Frontend Only</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;}
+    body{background:#f7fafc;color:#0f172a;margin:0;padding:24px;}
+    .container{max-width:900px;margin:24px auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 8px 30px rgba(2,6,23,0.08)}
+    h1{margin:0 0 12px;font-size:20px}
+    .card{border:1px solid #e6eef6;padding:12px;border-radius:8px;margin-bottom:12px}
+    label{display:block;font-weight:600;margin-bottom:6px}
+    input[type=number], textarea{width:100%;box-sizing:border-box;padding:8px;border-radius:6px;border:1px solid #d1e3f0}
+    .row{display:flex;gap:8px;margin-top:8px}
+    .btn{background:#0369a1;color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+    .btn:disabled{opacity:0.5;cursor:default}
+    pre.output{background:#0f172a;color:#f8fafc;padding:12px;border-radius:6px;overflow:auto;min-height:40px}
+    .note{font-size:13px;color:#475569}
+    .small{font-size:13px;color:#475569}
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>RSA Encryption Demo — Frontend only (no Python)</h1>
+
+    <section class="card">
+      <label>Key Size (bits)
+        <input id="keyBits" type="number" value="1024" min="512" step="256" />
+      </label>
+      <div class="row">
+        <button id="btnGen" class="btn">Generate Keys</button>
+        <button id="btnCopyPub" class="btn">Copy Public</button>
+        <button id="btnCopyPriv" class="btn">Copy Private</button>
+      </div>
+      <pre id="keysArea" class="output">No keys yet.</pre>
+      <div class="small">Generating 1024-bit keys in-browser may take a few seconds. 2048 is slower — try 1024 while experimenting.</div>
+    </section>
+
+    <section class="card">
+      <label>Plaintext:
+        <textarea id="plaintext" rows="4">Hello RSA!</textarea>
+      </label>
+      <div class="row">
+        <button id="btnEncrypt" class="btn">Encrypt</button>
+        <button id="btnDecrypt" class="btn">Decrypt</button>
+      </div>
+      <pre id="cipherArea" class="output"></pre>
+    </section>
+
+    <section class="card">
+      <label>Signing & Verification:
+        <div class="row">
+          <button id="btnSign" class="btn">Sign</button>
+          <button id="btnVerify" class="btn">Verify</button>
+        </div>
+      </label>
+      <pre id="sigArea" class="output"></pre>
+    </section>
+
+    <p class="note">Note: Demo only — NOT for real security use (missing padding like OAEP/PSS). This entire demo runs in your browser using BigInt and the Web Crypto API for hashing.</p>
+  </main>
+
+  <script>
+// ---------- BigInt & Crypto utilities ----------
+function hexToBigInt(hex){ if(!hex) return 0n; return BigInt('0x'+hex); }
+function bigIntToHex(b){ return b.toString(16); }
+
+function getRandomBitsBigInt(bits){
+  // produce a random BigInt of exactly bits bits (most-significant bit = 1)
+  const bytes = Math.ceil(bits/8);
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  // top bit ensure
+  arr[0] |= 1 << ((bits-1) % 8);
+  let hex = Array.from(arr).map(b=>b.toString(16).padStart(2,'0')).join('');
+  return BigInt('0x'+hex);
+}
+
+function modPow(base, exp, mod){
+  base = base % mod;
+  let result = 1n;
+  while(exp > 0){
+    if(exp & 1n) result = (result * base) % mod;
+    base = (base * base) % mod;
+    exp >>= 1n;
+  }
+  return result;
+}
+
+function gcd(a,b){ while(b){ const t = a % b; a=b; b=t;} return a; }
+
+function egcd(a,b){ if(b==0n) return [a,1n,0n]; const [g,x1,y1]=egcd(b,a%b); return [g,y1,x1 - (a/b)*y1]; }
+function modInv(a,m){ const [g,x] = (()=>{ const r=egcd(a,m); return [r[0], r[1]]; })(); if(g!==1n) throw new Error('No inverse'); return (x % m + m) % m; }
+
+// Miller-Rabin primality
+function randBetween(min, max){ // inclusive
+  const range = max - min + 1n;
+  const bits = range.toString(2).length;
+  while(true){
+    const r = getRandomBitsBigInt(bits);
+    const val = (r % range) + min;
+    if(val >= min && val <= max) return val;
+  }
+}
+
+function isProbablePrime(n, k=12){
+  if(n < 2n) return false;
+  const smallPrimes = [2n,3n,5n,7n,11n,13n,17n,19n,23n,29n];
+  for(const p of smallPrimes){ if(n===p) return true; if(n%p===0n) return false; }
+  let d = n-1n; let s=0n;
+  while(d%2n===0n){ d/=2n; s++; }
+  witnessLoop:
+  for(let i=0;i<k;i++){
+    const a = randBetween(2n, n-2n);
+    let x = modPow(a, d, n);
+    if(x===1n || x===n-1n) continue;
+    for(let r=1n;r<s;r++){
+      x = (x*x)%n;
+      if(x===n-1n) continue witnessLoop;
+    }
+    return false;
+  }
+  return true;
+}
+
+async function generatePrime(bits){
+  // produce odd candidate with top bit set
+  while(true){
+    let p = getRandomBitsBigInt(bits);
+    p |= 1n; // odd
+    // make sure top bit set
+    const topmask = 1n << BigInt(bits-1);
+    p |= topmask;
+    if(isProbablePrime(p)) return p;
+    // loop continues
+  }
+}
+
+async function generateRSAKeys(bits=1024, e=65537n){
+  const half = Math.floor(bits/2);
+  while(true){
+    const p = await generatePrime(half);
+    const q = await generatePrime(bits - half);
+    if(p===q) continue;
+    const n = p*q;
+    const phi = (p-1n)*(q-1n);
+    if(gcd(e, phi)===1n){
+      const d = modInv(e, phi);
+      return {n, e, d};
+    }
+  }
+}
+
+async function sha256ToBigInt(messageStr){
+  const enc = new TextEncoder();
+  const buf = enc.encode(messageStr);
+  const hash = await crypto.subtle.digest('SHA-256', buf);
+  const arr = Array.from(new Uint8Array(hash));
+  const hex = arr.map(b=>b.toString(16).padStart(2,'0')).join('');
+  return BigInt('0x'+hex);
+}
+
+// ---------- UI glue ----------
+const btnGen = document.getElementById('btnGen');
+const keysArea = document.getElementById('keysArea');
+const keyBitsInput = document.getElementById('keyBits');
+const btnEncrypt = document.getElementById('btnEncrypt');
+const btnDecrypt = document.getElementById('btnDecrypt');
+const cipherArea = document.getElementById('cipherArea');
+const plaintext = document.getElementById('plaintext');
+const btnSign = document.getElementById('btnSign');
+const btnVerify = document.getElementById('btnVerify');
+const sigArea = document.getElementById('sigArea');
+const btnCopyPub = document.getElementById('btnCopyPub');
+const btnCopyPriv = document.getElementById('btnCopyPriv');
+
+let KEYS = null; // {n,e,d} as BigInt
+
+function showKeys(){
+  if(!KEYS) { keysArea.textContent = 'No keys yet.'; return; }
+  keysArea.textContent = JSON.stringify({n: KEYS.n.toString(), e: KEYS.e.toString(), d: KEYS.d.toString()}, null, 2);
+}
+
+btnGen.addEventListener('click', async ()=>{
+  const bits = parseInt(keyBitsInput.value,10) || 1024;
+  btnGen.disabled = true; btnGen.textContent = 'Generating...';
+  try{
+    KEYS = await generateRSAKeys(bits, 65537n);
+    showKeys();
+  }catch(err){
+    keysArea.textContent = 'Error: '+err;
+  }finally{ btnGen.disabled = false; btnGen.textContent = 'Generate Keys'; }
+});
+
+btnEncrypt.addEventListener('click', ()=>{
+  if(!KEYS){ alert('Generate keys first'); return; }
+  const pt = new TextEncoder().encode(plaintext.value);
+  const m = BigInt('0x'+Array.from(pt).map(b=>b.toString(16).padStart(2,'0')).join(''));
+  if(m >= KEYS.n){ cipherArea.textContent = 'Error: Message too large for modulus.'; return; }
+  const c = modPow(m, KEYS.e, KEYS.n);
+  cipherArea.textContent = c.toString();
+});
+
+btnDecrypt.addEventListener('click', ()=>{
+  if(!KEYS){ alert('Generate keys first'); return; }
+  const cstr = cipherArea.textContent.trim();
+  if(!cstr){ alert('No ciphertext'); return; }
+  try{
+    const c = BigInt(cstr);
+    const m = modPow(c, KEYS.d, KEYS.n);
+    // convert m (hex) back to text
+    let hex = m.toString(16);
+    if(hex.length % 2) hex = '0'+hex;
+    const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(h=>parseInt(h,16)));
+    const pt = new TextDecoder().decode(bytes);
+    cipherArea.textContent = pt;
+  }catch(e){ cipherArea.textContent = 'Error: '+e; }
+});
+
+btnSign.addEventListener('click', async ()=>{
+  if(!KEYS){ alert('Generate keys first'); return; }
+  btnSign.disabled = true; btnSign.textContent = 'Signing...';
+  try{
+    const h = await sha256ToBigInt(plaintext.value);
+    const s = modPow(h, KEYS.d, KEYS.n);
+    sigArea.textContent = s.toString();
+  }catch(e){ sigArea.textContent = 'Error: '+e; }
+  finally{ btnSign.disabled = false; btnSign.textContent = 'Sign'; }
+});
+
+btnVerify.addEventListener('click', async ()=>{
+  if(!KEYS){ alert('Generate keys first'); return; }
+  const sstr = sigArea.textContent.trim();
+  if(!sstr){ alert('No signature'); return; }
+  btnVerify.disabled = true; btnVerify.textContent = 'Verifying...';
+  try{
+    const s = BigInt(sstr);
+    const h = await sha256ToBigInt(plaintext.value);
+    const recovered = modPow(s, KEYS.e, KEYS.n);
+    const ok = recovered === h;
+    sigArea.textContent = 'Valid: ' + ok;
+  }catch(e){ sigArea.textContent = 'Error: '+e; }
+  finally{ btnVerify.disabled = false; btnVerify.textContent = 'Verify'; }
+});
+
+btnCopyPub.addEventListener('click', ()=>{
+  if(!KEYS){ alert('Generate keys first'); return; }
+  const text = JSON.stringify({n: KEYS.n.toString(), e: KEYS.e.toString()}, null, 2);
+  navigator.clipboard.writeText(text).then(()=>alert('Public key copied'));
+});
+btnCopyPriv.addEventListener('click', ()=>{
+  if(!KEYS){ alert('Generate keys first'); return; }
+  const text = JSON.stringify({n: KEYS.n.toString(), d: KEYS.d.toString()}, null, 2);
+  navigator.clipboard.writeText(text).then(()=>alert('Private key copied'));
+});
+
+// show placeholder
+showKeys();
+  </script>
+</body>
+</html>
